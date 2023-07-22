@@ -180,6 +180,7 @@ class AtomisticTask(pl.LightningModule):
 
         loss = self.loss_fn(pred, targets)
 
+        self.log("lr", self.optimizer.state_dict()['param_groups'][0]['lr'], on_epoch=True)
         self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=False)
         self.log_metrics(pred, targets, "train")
         return loss
@@ -237,31 +238,92 @@ class AtomisticTask(pl.LightningModule):
         return pred
 
     def configure_optimizers(self):
-        optimizer = self.optimizer_cls(
+        self.optimizer = self.optimizer_cls(
             params=self.parameters(), **self.optimizer_kwargs
         )
+        return {
+            "optimizer": self.optimizer,
+            "lr_scheduler": {
+                # "scheduler": torch.optim.lr_scheduler.CyclicLR(
+                #     self.optimizer,
+                #     base_lr=1e-8,
+                #     max_lr=1e-4,
+                #     step_size_up=10,
+                #     step_size_down=20,
+                #     cycle_momentum=False,
+                #     mode="exp_range"
+                # ),
 
-        if self.scheduler_cls:
-            schedulers = []
-            schedule = self.scheduler_cls(optimizer=optimizer, **self.scheduler_kwargs)
-            optimconf = {"scheduler": schedule, "name": "lr_schedule"}
-            if self.schedule_monitor:
-                optimconf["monitor"] = self.schedule_monitor
-            # incase model is validated before epoch end (not recommended use of val_check_interval)
-            if self.trainer.val_check_interval < 1.0:
-                warnings.warn(
-                    "Learning rate is scheduled after epoch end. To enable scheduling before epoch end, "
-                    "please specify val_check_interval by the number of training epochs after which the "
-                    "model is validated."
-                )
-            # incase model is validated before epoch end (recommended use of val_check_interval)
-            if self.trainer.val_check_interval > 1.0:
-                optimconf["interval"] = "step"
-                optimconf["frequency"] = self.trainer.val_check_interval
-            schedulers.append(optimconf)
-            return [optimizer], schedulers
-        else:
-            return optimizer
+                # "scheduler": torch.optim.lr_scheduler.ExponentialLR(
+                #     self.optimizer,
+                #     T_0=5,
+                #     T_mult=2,
+                #     verbose=True
+                # ),
+
+                # "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+                #     self.optimizer,
+                #     mode='min',
+                #     factor=0.5,
+                #     patience=75,
+                #     threshold=0.0,
+                #     threshold_mode='rel',
+                #     cooldown=10,
+                # ),
+
+                # "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+                #     self.optimizer,
+                #     mode='min',
+                #     factor=0.5,
+                #     patience=75,
+                #     threshold=1e-4,
+                #     threshold_mode='rel',
+                #     cooldown=10,
+                # ),
+
+                # "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+                #     self.optimizer,
+                #     mode='min',
+                #     factor=0.5,
+                #     patience=75,
+                #     cooldown=10,
+                # ),
+
+                "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer,
+                    mode='min',
+                    factor=0.8,
+                    patience=75,
+                    cooldown=10,
+                ),
+                "monitor": "val_loss"
+
+            }
+        }
+
+
+
+        # if self.scheduler_cls:
+        #     schedulers = []
+        #     schedule = self.scheduler_cls(optimizer=optimizer, **self.scheduler_kwargs)
+        #     optimconf = {"scheduler": schedule, "name": "lr_schedule"}
+        #     if self.schedule_monitor:
+        #         optimconf["monitor"] = self.schedule_monitor
+        #     # incase model is validated before epoch end (not recommended use of val_check_interval)
+        #     if self.trainer.val_check_interval < 1.0:
+        #         warnings.warn(
+        #             "Learning rate is scheduled after epoch end. To enable scheduling before epoch end, "
+        #             "please specify val_check_interval by the number of training epochs after which the "
+        #             "model is validated."
+        #         )
+        #     # incase model is validated before epoch end (recommended use of val_check_interval)
+        #     if self.trainer.val_check_interval > 1.0:
+        #         optimconf["interval"] = "step"
+        #         optimconf["frequency"] = self.trainer.val_check_interval
+        #     schedulers.append(optimconf)
+        #     return [optimizer], schedulers
+        # else:
+        #     return optimizer
 
     def optimizer_step(
         self,
