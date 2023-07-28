@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 import torch
 from torch import nn as nn
 from torchmetrics import Metric
+import numpy as np
 
 from schnetpack.model.base import AtomisticModel
 
@@ -18,13 +19,13 @@ class ModelOutput(nn.Module):
     """
 
     def __init__(
-        self,
-        name: str,
-        loss_fn: Optional[nn.Module] = None,
-        loss_weight: float = 1.0,
-        metrics: Optional[Dict[str, Metric]] = None,
-        constraints: Optional[List[torch.nn.Module]] = None,
-        target_property: Optional[str] = None,
+            self,
+            name: str,
+            loss_fn: Optional[nn.Module] = None,
+            loss_weight: float = 1.0,
+            metrics: Optional[Dict[str, Metric]] = None,
+            constraints: Optional[List[torch.nn.Module]] = None,
+            target_property: Optional[str] = None,
     ):
         """
         Args:
@@ -95,15 +96,15 @@ class AtomisticTask(pl.LightningModule):
     """
 
     def __init__(
-        self,
-        model: AtomisticModel,
-        outputs: List[ModelOutput],
-        optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
-        optimizer_args: Optional[Dict[str, Any]] = None,
-        scheduler_cls: Optional[Type] = None,
-        scheduler_args: Optional[Dict[str, Any]] = None,
-        scheduler_monitor: Optional[str] = None,
-        warmup_steps: int = 0,
+            self,
+            model: AtomisticModel,
+            outputs: List[ModelOutput],
+            optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
+            optimizer_args: Optional[Dict[str, Any]] = None,
+            scheduler_cls: Optional[Type] = None,
+            scheduler_args: Optional[Dict[str, Any]] = None,
+            scheduler_monitor: Optional[str] = None,
+            warmup_steps: int = 0,
     ):
         """
         Args:
@@ -180,9 +181,10 @@ class AtomisticTask(pl.LightningModule):
 
         loss = self.loss_fn(pred, targets)
 
-        self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=False)
-        self.log_metrics(pred, targets, "train")
+        self.log("lr", self.optimizer.state_dict()['param_groups'][0]['lr'], on_epoch=True)
+        self.log("train_loss", loss, on_epoch=True, prog_bar=False)
         return loss
+
 
     def validation_step(self, batch, batch_idx):
         torch.set_grad_enabled(self.grad_enabled)
@@ -264,11 +266,11 @@ class AtomisticTask(pl.LightningModule):
             return optimizer
 
     def optimizer_step(
-        self,
-        epoch: int = None,
-        batch_idx: int = None,
-        optimizer=None,
-        optimizer_closure=None,
+            self,
+            epoch: int = None,
+            batch_idx: int = None,
+            optimizer=None,
+            optimizer_closure=None,
     ):
         if self.global_step < self.warmup_steps:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.warmup_steps)
@@ -325,3 +327,143 @@ class ConsiderOnlySelectedAtoms(nn.Module):
         ]
 
         return pred, targets
+
+
+class SinglePropertyClrTask(AtomisticTask):
+    def __init__(
+            self,
+            model: AtomisticModel,
+            outputs: List[ModelOutput],
+            optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
+            optimizer_args: Optional[Dict[str, Any]] = None,
+            scheduler_cls: Optional[Type] = None,
+            scheduler_args: Optional[Dict[str, Any]] = None,
+            scheduler_monitor: Optional[str] = None,
+            warmup_steps: int = 0,
+            predict_property: str = 'binding_e',
+    ):
+        """
+        Args:
+            model: the neural network model
+            outputs: list of outputs an optional loss functions
+            optimizer_cls: type of torch optimizer,e.g. torch.optim.Adam
+            optimizer_args: dict of optimizer keyword arguments
+            scheduler_cls: type of torch learning rate scheduler
+            scheduler_args: dict of scheduler keyword arguments
+            scheduler_monitor: name of metric to be observed for ReduceLROnPlateau
+            warmup_steps: number of steps used to increase the learning rate from zero
+              linearly to the target learning rate at the beginning of training
+        """
+        super(SinglePropertyClrTask, self).__init__(
+            model=model,
+            outputs=outputs,
+            optimizer_cls=optimizer_cls,
+            optimizer_args=optimizer_args,
+            scheduler_cls=scheduler_cls,
+            scheduler_args=scheduler_args,
+            scheduler_monitor=scheduler_monitor,
+            warmup_steps=warmup_steps
+        )
+        self.model = model
+        self.optimizer_cls = optimizer_cls
+        self.optimizer_kwargs = optimizer_args
+        self.scheduler_cls = scheduler_cls
+        self.scheduler_kwargs = scheduler_args
+        self.schedule_monitor = scheduler_monitor
+        self.outputs = nn.ModuleList(outputs)
+
+        self.grad_enabled = len(self.model.required_derivatives) > 0
+        self.lr = optimizer_args["lr"]
+        self.warmup_steps = warmup_steps
+        self.save_hyperparameters()
+        self.predict_property = predict_property
+
+    def validation_step(self, batch, batch_idx):
+        torch.set_grad_enabled(self.grad_enabled)
+
+        targets = {
+            output.target_property: batch[output.target_property]
+            for output in self.outputs
+            if not isinstance(output, UnsupervisedModelOutput)
+        }
+        try:
+            targets["considered_atoms"] = batch["considered_atoms"]
+        except:
+            pass
+
+        pred = self.predict_without_postprocessing(batch)
+        pred, targets = self.apply_constraints(pred, targets)
+
+        flatten_pred = torch.flatten(pred[self.predict_property]).detach().cpu().numpy()
+        flatten_targets = torch.flatten(targets[self.predict_property]).detach().cpu().numpy()
+        loss = np.mean(np.abs(flatten_targets - flatten_pred))
+
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+
+        return {"val_loss": loss}
+
+    def test_step(self, batch, batch_idx):
+        torch.set_grad_enabled(self.grad_enabled)
+
+        targets = {
+            output.target_property: batch[output.target_property]
+            for output in self.outputs
+            if not isinstance(output, UnsupervisedModelOutput)
+        }
+        try:
+            targets["considered_atoms"] = batch["considered_atoms"]
+        except:
+            pass
+
+        pred = self.predict_without_postprocessing(batch)
+        pred, targets = self.apply_constraints(pred, targets)
+
+        flatten_pred = torch.flatten(pred[self.predict_property]).detach().cpu().numpy()
+        flatten_targets = torch.flatten(targets[self.predict_property]).detach().cpu().numpy()
+
+        if self.predict_property in ['dielectric_constant', 'viscosity']:
+            flatten_pred = pow(10, flatten_pred)
+            flatten_targets = pow(10, flatten_targets)
+
+        print('====================================================================')
+        print('====================================================================')
+        print('=============================== Flatten prediction ================================')
+        print(flatten_pred)
+        print('====================================================================')
+        print('====================================================================')
+
+        print('====================================================================')
+        print('====================================================================')
+        print('=============================== Flatten target ================================')
+        print(flatten_targets)
+        print('====================================================================')
+        print('====================================================================')
+
+        with open("pred", "a") as pred:
+            pred.writelines(list(map(lambda x: str(x) + "\n", flatten_pred)))
+        with open("target", "a") as target:
+            target.writelines(list(map(lambda x: str(x) + "\n", flatten_targets)))
+
+        loss = np.mean(np.abs(flatten_targets - flatten_pred))
+        self.log("test_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        return {"test_loss": loss}
+
+    def configure_optimizers(self):
+        self.optimizer = self.optimizer_cls(
+            params=self.parameters(), **self.optimizer_kwargs
+        )
+        return {
+            "optimizer": self.optimizer,
+            "lr_scheduler": {
+                "scheduler": torch.optim.lr_scheduler.CyclicLR(
+                    self.optimizer,
+                    base_lr=self.scheduler_kwargs['base_lr'],
+                    max_lr=self.scheduler_kwargs['max_lr'],
+                    step_size_up=self.scheduler_kwargs['step_size_up'],
+                    step_size_down=self.scheduler_kwargs['step_size_down'],
+                    cycle_momentum=False,
+                    mode=self.scheduler_kwargs['lr_mode'],
+                ),
+            }
+        }
+
